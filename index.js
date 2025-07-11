@@ -1,43 +1,81 @@
-// index.js
-require('dotenv').config(); // Load environment variables from .env file
+require('dotenv').config();
 const express = require('express');
-const cors = require('cors'); // Import the CORS middleware
+const cors = require('cors');
+const http = require('http'); // Required for Socket.io
+const { Server } = require('socket.io'); // Import Socket.io
 const productRoutes = require('./routes/productRoutes');
 const saleRoutes = require('./routes/saleRoutes');
-const reportRoutes = require('./routes/reportRoutes'); // <--- NEW: Import reportRoutes
-const agreementRoutes = require('./routes/agreementRoutes'); // ✨ NEW: Import agreementRoutes ✨
-const commissionRoutes = require('./routes/commissionRoutes'); // ⭐ NEW: Import commissionRoutes ⭐
+const reportRoutes = require('./routes/reportRoutes');
+const agreementRoutes = require('./routes/agreementRoutes');
+const commissionRoutes = require('./routes/commissionRoutes');
 const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
-// --- CRITICAL FIX 1: Use PORT from .env file (now 5000) ---
-// This will now correctly use the PORT defined in your .env file
-const PORT = process.env.PORT || 8000; // Fallback to 8000 if .env isn't set, but ensure your .env has PORT=8000
+const PORT = process.env.PORT || 8000;
 
-// --- MIDDLEWARE ---
-// IMPORTANT: Make sure CORS allows your frontend's origin if they are on different domains/ports.
-// Since frontend is 8080 and backend will be 8000, this setup with `cors()` is usually fine for local dev.
+// --- Create HTTP server for Socket.io ---
+const server = http.createServer(app);
+
+// --- Socket.io Setup ---
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:8080", // Allow frontend (Vite/React) to connect
+    methods: ["GET", "POST", "DELETE", "PUT"],
+  },
+});
+
+// Track connected clients (optional)
+let clients = [];
+
+io.on('connection', (socket) => {
+  console.log('🔌 New client connected:', socket.id);
+  clients.push(socket);
+
+  // Notify all clients when a product is updated/deleted
+  socket.on('product_updated', (data) => {
+    io.emit('refresh_products', data); // Broadcast to all clients
+  });
+
+  socket.on('disconnect', () => {
+    clients = clients.filter(client => client.id !== socket.id);
+    console.log('❌ Client disconnected:', socket.id);
+  });
+});
+
+// --- Middleware ---
 app.use(cors());
 app.use(express.json());
 
-// --- ROUTES ---
-
+// --- Routes ---
 app.get('/', (req, res) => {
-    res.send(`Welcome to the API! Server running on port ${PORT}. Use /api/products, /api/sales, /api/reports, /api/agreements, or /api/commissions.`);
+  res.send(`Welcome to the API! Server running on port ${PORT}. Use /api/products, /api/sales, etc.`);
 });
 
 app.use('/api/products', productRoutes);
 app.use('/api/sales', saleRoutes);
-app.use('/api/reports', reportRoutes); // <--- NEW: Mount report routes under /api/reports
-app.use('/api/agreements', agreementRoutes); // ✨ NEW: Mount agreement routes under /api/agreements ✨
-app.use('/api/commissions', commissionRoutes); // ⭐ NEW: Mount commission routes under /api/commissions ⭐
+app.use('/api/reports', reportRoutes);
+app.use('/api/agreements', agreementRoutes);
+app.use('/api/commissions', commissionRoutes);
 
-// Global error handler middleware. This should be defined last.
+// --- Modify Product Routes to Emit Events ---
+// Example: In your productRoutes.js (or controller), add Socket.io emits:
+/*
+  const deleteProduct = async (req, res) => {
+    const { id } = req.params;
+    await Product.findByIdAndDelete(id);
+    
+    // Notify all clients
+    req.app.get('io').emit('refresh_products', { action: 'delete', id });
+    
+    res.status(204).send();
+  };
+*/
+
+// Global error handler
 app.use(errorHandler);
 
-// --- SERVER START ---
-console.log('--- Backend Server Starting NOW ---');
-app.listen(PORT, () => {
-    console.log(`Backend Server running: http://localhost:${PORT}`);
-    console.log(`Ensure your frontend proxy (vite.config.ts or direct calls) targets http://localhost:${PORT}`);
+// --- Start Server ---
+server.listen(PORT, () => {
+  console.log(`🚀 Backend running: http://localhost:${PORT}`);
+  console.log(`🛰️ Socket.io ready for real-time updates`);
 });
