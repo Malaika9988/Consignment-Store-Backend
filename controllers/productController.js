@@ -185,6 +185,10 @@ exports.deleteConsignor = async (req, res) => {
     }
 };
 
+// ===========================================
+// Products Related Functions
+// ===========================================
+
 exports.getAllProducts = async (req, res) => {
     console.log(`[${new Date().toISOString()}] GET /api/products called.`);
     try {
@@ -194,7 +198,8 @@ exports.getAllProducts = async (req, res) => {
                 id, name, category, condition, consignor_id, description,
                 expected_price, minimum_price, quantity, image_url, status, barcode,
                 created_at, updated_at,
-                consignors (full_name, email)
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select ⭐
             `);
 
         if (error) {
@@ -202,8 +207,21 @@ exports.getAllProducts = async (req, res) => {
             return res.status(500).json({ message: 'Error fetching products from database', error: error.message });
         }
 
-        console.log(`[${new Date().toISOString()}] Returning ${data.length} products from DB.`);
-        res.status(200).json(data);
+        const formattedProducts = data.map(product => ({
+            ...product,
+            consignor_name: product.consignors ? product.consignors.full_name : 'N/A',
+            consignor: product.consignors ? {
+                id: product.consignors.id,
+                name: product.consignors.full_name
+            } : null,
+            // ⭐ MODIFIED: Extracting commission_rate from agreements ⭐
+            commission_rate: product.agreements && product.agreements.length > 0
+                                 ? product.agreements[0].commission_rate
+                                 : 0 // Default to 0 if no agreement or commission_rate is null
+        }));
+
+        console.log(`[${new Date().toISOString()}] Returning ${formattedProducts.length} products from DB.`);
+        res.status(200).json(formattedProducts);
     } catch (err) {
         console.error("Server Error - getAllProducts:", err);
         res.status(500).json({ message: 'Internal server error', error: err.message });
@@ -225,7 +243,8 @@ exports.getProductByBarcode = async (req, res) => {
                 id, name, category, condition, expected_price, minimum_price,
                 consignor_id, description, quantity, image_url, status, barcode,
                 created_at, updated_at,
-                consignors (full_name, email)
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select here too ⭐
             `)
             .eq('barcode', barcode)
             .single();
@@ -240,7 +259,16 @@ exports.getProductByBarcode = async (req, res) => {
 
         const formattedProduct = data ? {
             ...data,
-            price: data.expected_price
+            price: data.expected_price,
+            consignor_name: data.consignors ? data.consignors.full_name : 'N/A',
+            consignor: data.consignors ? {
+                id: data.consignors.id,
+                name: data.consignors.full_name
+            } : null,
+            // ⭐ MODIFIED: Extracting commission_rate ⭐
+            commission_rate: data.agreements && data.agreements.length > 0
+                                 ? data.agreements[0].commission_rate
+                                 : 0 // Default to 0 if no agreement or commission_rate is null
         } : null;
 
         if (!formattedProduct) {
@@ -286,7 +314,8 @@ exports.addProduct = async (req, res) => {
                 id, name, category, condition, consignor_id, description,
                 expected_price, minimum_price, quantity, image_url, status, barcode,
                 created_at, updated_at,
-                consignors (full_name, email)
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select here too ⭐
             `);
 
         if (error) {
@@ -297,8 +326,21 @@ exports.addProduct = async (req, res) => {
             return res.status(500).json({ message: 'Internal server error', error: error.message });
         }
 
-        console.log(`[${new Date().toISOString()}] Product added to DB:`, data[0]);
-        res.status(201).json(data[0]);
+        const formattedProduct = {
+            ...data[0],
+            consignor_name: data[0].consignors ? data[0].consignors.full_name : 'N/A',
+            consignor: data[0].consignors ? {
+                id: data[0].consignors.id,
+                name: data[0].consignors.full_name
+            } : null,
+            // ⭐ MODIFIED: Extracting commission_rate ⭐
+            commission_rate: data[0].agreements && data[0].agreements.length > 0
+                                 ? data[0].agreements[0].commission_rate
+                                 : 0 // Default to 0 if no agreement or commission_rate is null
+        };
+
+        console.log(`[${new Date().toISOString()}] Product added to DB:`, formattedProduct);
+        res.status(201).json(formattedProduct);
     } catch (err) {
         console.error("Server Error - addProduct:", err);
         res.status(500).json({ message: 'Internal server error', error: err.message });
@@ -348,7 +390,8 @@ exports.updateProduct = async (req, res) => {
                 id, name, category, condition, consignor_id, description,
                 expected_price, minimum_price, quantity, image_url, status, barcode,
                 created_at, updated_at,
-                consignors (full_name, email)
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select here too ⭐
             `);
 
         if (error) {
@@ -363,8 +406,21 @@ exports.updateProduct = async (req, res) => {
             return res.status(404).json({ message: 'Product not found for update.' });
         }
 
-        console.log(`[${new Date().toISOString()}] Product updated in DB:`, data[0]);
-        res.status(200).json(data[0]);
+        const formattedProduct = {
+            ...data[0],
+            consignor_name: data[0].consignors ? data[0].consignors.full_name : 'N/A',
+            consignor: data[0].consignors ? {
+                id: data[0].consignors.id,
+                name: data[0].consignors.full_name
+            } : null,
+            // ⭐ MODIFIED: Extracting commission_rate ⭐
+            commission_rate: data[0].agreements && data[0].agreements.length > 0
+                                 ? data[0].agreements[0].commission_rate
+                                 : 0 // Default to 0 if no agreement or commission_rate is null
+        };
+
+        console.log(`[${new Date().toISOString()}] Product updated in DB:`, formattedProduct);
+        res.status(200).json(formattedProduct);
     } catch (err) {
         console.error("Server Error - updateProduct:", err);
         res.status(500).json({ message: 'Internal server error', error: err.message });
@@ -412,10 +468,11 @@ exports.getAllProductsEligibleForSale = async (req, res) => {
                 id, name, category, condition, expected_price, minimum_price,
                 consignor_id, description, quantity, image_url, status, barcode,
                 created_at, updated_at,
-                consignors (full_name, email)
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select here too ⭐
             `)
             .gt('quantity', 0)
-            .in('status', ['in_stock', 'paid']); // Reverted back to 'in_stock' as this will be valid after DB schema update
+            .in('status', ['in_stock', 'paid']);
 
         if (error) {
             console.error("Supabase Error - getAllProductsEligibleForSale:", error);
@@ -426,6 +483,14 @@ exports.getAllProductsEligibleForSale = async (req, res) => {
             ...product,
             price: product.expected_price,
             consignor_name: product.consignors ? product.consignors.full_name : 'N/A',
+            // ⭐ MODIFIED: Now dynamically pulling commission_rate from agreements ⭐
+            commission_rate: product.agreements && product.agreements.length > 0
+                                 ? product.agreements[0].commission_rate
+                                 : 0, // Default to 0 if no agreement or commission_rate is null
+            consignor: product.consignors ? {
+                id: product.consignors.id,
+                name: product.consignors.full_name
+            } : null
         }));
 
         console.log(`[${new Date().toISOString()}] Returning ${formattedProducts.length} eligible products from DB.`);
@@ -505,12 +570,18 @@ exports.updateProductLocationAndStatus = async (req, res) => {
         const { data: productUpdateData, error: productUpdateError } = await supabase
             .from('products')
             .update({
-                status: 'in_stock', // ✅ Corrected: Set to 'in_stock' now that DB allows it
+                status: 'in_stock',
                 quantity: locationQuantity,
                 updated_at: new Date().toISOString()
             })
             .eq('id', productId)
-            .select();
+            .select(`
+                id, name, category, condition, consignor_id, description,
+                expected_price, minimum_price, quantity, image_url, status, barcode,
+                created_at, updated_at,
+                consignors (id, full_name, email),
+                agreements (commission_rate) // ⭐ MODIFIED: Added agreements select here too ⭐
+            `);
 
         if (productUpdateError) {
             console.error(`Supabase Error - updateProductLocationAndStatus (products status/quantity update) for ID ${productId}:`, productUpdateError);
@@ -520,11 +591,24 @@ exports.updateProductLocationAndStatus = async (req, res) => {
             });
         }
 
-        console.log(`[${new Date().toISOString()}] Product ID ${productId} location updated and status set to in_stock.`); // ✅ Corrected log message
+        const formattedProduct = {
+            ...productUpdateData[0],
+            consignor_name: productUpdateData[0].consignors ? productUpdateData[0].consignors.full_name : 'N/A',
+            consignor: productUpdateData[0].consignors ? {
+                id: productUpdateData[0].consignors.id,
+                name: productUpdateData[0].consignors.full_name
+            } : null,
+            // ⭐ MODIFIED: Extracting commission_rate ⭐
+            commission_rate: productUpdateData[0].agreements && productUpdateData[0].agreements.length > 0
+                                 ? productUpdateData[0].agreements[0].commission_rate
+                                 : 0 // Default to 0 if no agreement or commission_rate is null
+        };
+
+        console.log(`[${new Date().toISOString()}] Product ID ${productId} location updated and status set to in_stock.`);
         res.status(200).json({
-            message: 'Product location updated and status set to in_stock successfully', // ✅ Corrected response message
+            message: 'Product location updated and status set to in_stock successfully',
             product_location: locationData[0],
-            updated_product: productUpdateData[0]
+            updated_product: formattedProduct
         });
 
     } catch (err) {

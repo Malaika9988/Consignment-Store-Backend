@@ -1,296 +1,398 @@
-// backend/controllers/agreementController.js
 const supabase = require('../config/supabaseClient');
 
-// --- Agreement Controllers ---
+// Helper function to transform database snake_case to frontend camelCase
+const toCamelCase = (data) => {
+    if (!data) return data;
+
+    if (Array.isArray(data)) {
+        return data.map(item => toCamelCase(item));
+    }
+
+    if (typeof data === 'object' && data !== null) {
+        return Object.keys(data).reduce((acc, key) => {
+            const camelKey = key.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
+            acc[camelKey] = toCamelCase(data[key]);
+            return acc;
+        }, {});
+    }
+
+    return data;
+};
+
+// Helper function to transform frontend camelCase to database snake_case
+const toSnakeCase = (data) => {
+    if (!data) return data;
+
+    if (Array.isArray(data)) {
+        return data.map(item => toSnakeCase(item));
+    }
+
+    if (typeof data === 'object' && data !== null) {
+        return Object.keys(data).reduce((acc, key) => {
+            const snakeKey = key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+            acc[snakeKey] = toSnakeCase(data[key]);
+            return acc;
+        }, {});
+    }
+
+    return data;
+};
 
 // Add a new agreement
 exports.addAgreement = async (req, res) => {
-    console.log(`[${new Date().toISOString()}] POST /api/agreements called. Body:`, req.body);
-
-    const {
-        product_id,
-        consignor_id,
-        commission_rate,
-        unsold_item_policy,
-        // Removed discount_percentage and discount_interval_days from top-level destructuring
-        // as they belong inside discount_policy JSONB.
-        store_purchase_percentage,
-        agreement_acknowledged,
-        acknowledgment_date,
-        // Also capture other fields that might be part of discount_policy from req.body
-        // This assumes frontend might send them individually or as a nested object
-        discount_percentage,
-        discount_interval_days,
-        discount_enabled, // Assuming frontend might send this, default to false if not
-        discount_start_after_days, // Assuming frontend might send this, default to 30 if not
-    } = req.body;
-
-    // Basic validation for NOT NULL fields in Agreements schema
-    if (commission_rate === undefined || unsold_item_policy === undefined || !product_id || !consignor_id) {
-        return res.status(400).json({ message: 'Missing required agreement fields: product_id, consignor_id, commission_rate, unsold_item_policy.' });
-    }
-
-    // Construct the discount_policy JSONB object based on provided or default values
-    const discountPolicy = {
-        enabled: discount_enabled !== undefined ? Boolean(discount_enabled) : false,
-        percentage: discount_percentage !== undefined ? parseFloat(discount_percentage) : 0,
-        start_after_days: discount_start_after_days !== undefined ? parseInt(discount_start_after_days) : 30,
-        interval_days: discount_interval_days !== undefined ? parseInt(discount_interval_days) : 15,
-    };
-
-    // Prepare data for insertion
-    const agreementToInsert = {
-        product_id: parseInt(product_id),
-        consignor_id: parseInt(consignor_id),
-        commission_rate: parseFloat(commission_rate),
-        unsold_item_policy: unsold_item_policy,
-        // Store the constructed discount_policy object as JSONB
-        discount_policy: discountPolicy,
-        store_purchase_percentage: store_purchase_percentage !== undefined ? parseFloat(store_purchase_percentage) : null,
-        agreement_acknowledged: agreement_acknowledged !== undefined ? Boolean(agreement_acknowledged) : false, // Default to false
-        acknowledgment_date: acknowledgment_date ? new Date(acknowledgment_date).toISOString() : null,
-    };
+    console.log('[%s] POST /api/agreements/add-agreement called. Body: %j', new Date().toISOString(), req.body);
 
     try {
-        const { data, error } = await supabase
-            .from('agreements')
-            .insert([agreementToInsert])
-            .select(`
-                *,
-                products (name, category),
-                consignors (full_name, email)
-            `);
+        const {
+            productId,
+            consignorId,
+            commissionRate,
+            unsoldItemPolicy,
+            returnFallbackDays,
+            discountSchedule = [], // This is the JS array from the client
+            charityChoice,
+            agreementAcknowledged,
+            acknowledgmentDate, // This is the raw input from the client
+            storePurchaseOption = false, // Added: default to false if not provided
+            storePurchasePercentage = 0, // Added: default to 0 if not provided
+        } = req.body;
 
-        if (error) {
-            console.error("Supabase Error - addAgreement:", error);
-            if (error.code === '23503') { // Foreign key violation
-                return res.status(400).json({ message: 'Invalid product_id or consignor_id.', error: error.message });
+        // Basic validation for required fields
+        if (!productId || !consignorId || commissionRate === undefined || commissionRate === null) {
+            return res.status(400).json({
+                message: 'Missing required fields: productId, consignorId, commissionRate'
+            });
+        }
+
+        // --- Data Pre-processing for PostgreSQL RPC ---
+
+        // 1. Process acknowledgmentDate: Ensure it's a valid ISO string or null for TIMESTAMPTZ
+        let processedAcknowledgmentDate = null;
+        if (acknowledgmentDate) {
+            try {
+                processedAcknowledgmentDate = new Date(acknowledgmentDate).toISOString();
+            } catch (e) {
+                console.warn(`[addAgreement] Invalid acknowledgmentDate format received: "${acknowledgmentDate}". Setting to null.`);
+                processedAcknowledgmentDate = null;
             }
-            return res.status(500).json({ message: 'Error adding agreement to database', error: error.message });
         }
 
-        console.log(`[${new Date().toISOString()}] Agreement added to DB:`, data[0]);
-        res.status(201).json(data[0]);
-    } catch (err) {
-        console.error("Server Error - addAgreement:", err);
-        res.status(500).json({ message: 'Internal server error', error: err.message });
+        // 2. Process discountSchedule and determine discountScheduleEnabled for JSONB
+        const determinedDiscountScheduleEnabled = discountSchedule && discountSchedule.length > 0;
+        const processedDiscountSchedule = determinedDiscountScheduleEnabled
+            ? JSON.stringify(discountSchedule)
+            : '[]'; // Crucial: Send "[]" for empty JSONB, not null
+
+        // 3. Process returnFallbackDays: Ensure it's null if unsoldItemPolicy is not 'return' for INT
+        const processedReturnFallbackDays = unsoldItemPolicy === 'return'
+            ? returnFallbackDays
+            : null;
+
+        // Prepare parameters for the PostgreSQL function
+        const rpcPayload = {
+            p_acknowledgment_date: processedAcknowledgmentDate,
+            p_agreement_acknowledged: agreementAcknowledged,
+            p_charity_choice: unsoldItemPolicy === 'donate' ? charityChoice : null,
+            p_commission_rate: commissionRate,
+            p_consignor_id: consignorId,
+            p_discount_schedule: processedDiscountSchedule,
+            p_discount_schedule_enabled: determinedDiscountScheduleEnabled,
+            p_product_id: productId,
+            p_return_fallback_days: processedReturnFallbackDays,
+            p_unsold_item_policy: unsoldItemPolicy,
+            p_store_purchase_option: storePurchaseOption,      // Added
+            p_store_purchase_percentage: storePurchasePercentage, // Added
+        };
+
+        console.log('--- RPC Payload for create_agreement_with_details:', JSON.stringify(rpcPayload, null, 2));
+
+        const { data: agreement, error: agreementError } = await supabase
+            .rpc('create_agreement_with_details', rpcPayload);
+
+        if (agreementError) {
+            console.error('Supabase RPC Error (create_agreement_with_details):', agreementError);
+            if (agreementError.code === 'PGRST203') {
+                return res.status(400).json({
+                    message: 'Database function `create_agreement_with_details` not found or parameter types mismatch. Ensure your database functions are correctly deployed and match the payload types.',
+                    error: agreementError.message,
+                    details: agreementError.details
+                });
+            }
+            return res.status(500).json({
+                message: 'Internal server error during agreement creation.',
+                error: agreementError.message,
+                details: agreementError.details || 'No additional details provided from database.'
+            });
+        }
+
+        const newAgreementId = agreement?.[0]?.id;
+        if (!newAgreementId) {
+            throw new Error('Failed to retrieve agreement ID after creation via RPC');
+        }
+
+        // Fetch the full agreement details with related data for the response
+        const { data: fullAgreement, error: fetchError } = await supabase
+            .from('agreements')
+            .select(`
+                *,
+                progressive_discounts:progressive_discounts(id, days_after_listing, discount_percent),
+                charity_donations:charity_donations(id, charity_choice)
+            `)
+            .eq('id', newAgreementId)
+            .single();
+
+        if (fetchError) {
+            console.error('Supabase Fetch Error (after create):', fetchError);
+            throw fetchError;
+        }
+        if (!fullAgreement) {
+            throw new Error('Agreement not found after successful creation and fetch');
+        }
+
+        const response = {
+            ...toCamelCase(fullAgreement),
+            discountPolicy: fullAgreement.progressive_discounts?.length > 0 ? 'discount' : 'none',
+            discountSchedule: fullAgreement.progressive_discounts?.map(d => ({
+                days: d.days_after_listing,
+                percent: d.discount_percent
+            })) || [],
+            charityChoice: fullAgreement.charity_donations?.[0]?.charity_choice || null,
+            discountScheduleEnabled: fullAgreement.progressive_discounts?.length > 0
+        };
+
+        res.status(201).json(response);
+    } catch (error) {
+        console.error('Error in addAgreement:', error);
+        res.status(500).json({
+            message: 'Internal server error',
+            error: error.message,
+            details: error.details || 'No additional details provided from database.'
+        });
     }
 };
 
-// Get all agreements
+// Get all agreements (no changes needed)
 exports.getAllAgreements = async (req, res) => {
-    console.log(`[${new Date().toISOString()}] GET /api/agreements called.`);
     try {
         const { data, error } = await supabase
             .from('agreements')
             .select(`
                 *,
-                products (id, name, category),
-                consignors (id, full_name, email)
-            `);
+                progressive_discounts:progressive_discounts(id, days_after_listing, discount_percent),
+                charity_donations:charity_donations(id, charity_choice)
+            `)
+            .order('created_at', { ascending: false });
 
-        if (error) {
-            console.error("Supabase Error - getAllAgreements:", error);
-            return res.status(500).json({ message: 'Error fetching agreements from database', error: error.message });
-        }
+        if (error) throw error;
 
-        console.log(`[${new Date().toISOString()}] Returning ${data.length} agreements from DB.`);
-        res.status(200).json(data);
-    } catch (err) {
-        console.error("Server Error - getAllAgreements:", err);
-        res.status(500).json({ message: 'Internal server error', error: err.message });
+        const response = data.map(agreement => ({
+            ...toCamelCase(agreement),
+            discountPolicy: agreement.progressive_discounts?.length > 0 ? 'discount' : 'none',
+            discountSchedule: agreement.progressive_discounts?.map(d => ({
+                days: d.days_after_listing,
+                percent: d.discount_percent
+            })) || [],
+            charityChoice: agreement.charity_donations?.[0]?.charity_choice || null,
+            discountScheduleEnabled: agreement.progressive_discounts?.length > 0
+        }));
+
+        res.status(200).json(response);
+    } catch (error) {
+        console.error('Error in getAllAgreements:', error);
+        res.status(500).json({
+            message: 'Internal server error',
+            error: error.message
+        });
     }
 };
 
-// Get agreement by ID
+// Get agreement by ID (no changes needed)
 exports.getAgreementById = async (req, res) => {
-    const agreementId = parseInt(req.params.id);
-    console.log(`[${new Date().toISOString()}] GET /api/agreements/${agreementId} called.`);
-
-    if (isNaN(agreementId)) {
-        return res.status(400).json({ message: 'Invalid agreement ID provided.' });
-    }
-
     try {
+        const agreementId = parseInt(req.params.id);
+        if (isNaN(agreementId)) {
+            return res.status(400).json({ message: 'Invalid agreement ID' });
+        }
+
         const { data, error } = await supabase
             .from('agreements')
             .select(`
                 *,
-                products (id, name, category),
-                consignors (id, full_name, email)
+                progressive_discounts:progressive_discounts(id, days_after_listing, discount_percent),
+                charity_donations:charity_donations(id, charity_choice)
             `)
             .eq('id', agreementId)
             .single();
 
-        if (error) {
-            console.error(`Supabase Error - getAgreementById for ID ${agreementId}:`, error);
-            if (error.code === 'PGRST116') {
-                return res.status(404).json({ message: `Agreement with ID ${agreementId} not found.` });
-            }
-            return res.status(500).json({ message: 'Error fetching agreement from database', error: error.message });
-        }
+        if (error) throw error;
+        if (!data) return res.status(404).json({ message: 'Agreement not found' });
 
-        if (!data) {
-            return res.status(404).json({ message: `Agreement with ID ${agreementId} not found.` });
-        }
+        const response = {
+            ...toCamelCase(data),
+            discountPolicy: data.progressive_discounts?.length > 0 ? 'discount' : 'none',
+            discountSchedule: data.progressive_discounts?.map(d => ({
+                days: d.days_after_listing,
+                percent: d.discount_percent
+            })) || [],
+            charityChoice: data.charity_donations?.[0]?.charity_choice || null,
+            discountScheduleEnabled: data.progressive_discounts?.length > 0
+        };
 
-        console.log(`[${new Date().toISOString()}] Returning agreement with ID ${agreementId}:`, data);
-        res.status(200).json(data);
-    } catch (err) {
-        console.error("Server Error - getAgreementById:", err);
-        res.status(500).json({ message: 'Internal server error', error: err.message });
+        res.status(200).json(response);
+    } catch (error) {
+        console.error('Error in getAgreementById:', error);
+        res.status(500).json({
+            message: 'Internal server error',
+            error: error.message
+        });
     }
 };
 
-// Update an existing agreement by ID
+// Update agreement
 exports.updateAgreement = async (req, res) => {
-    const agreementId = parseInt(req.params.id);
-    const updateData = req.body;
-    console.log(`[${new Date().toISOString()}] PUT /api/agreements/${agreementId} called. Update data:`, updateData);
-
-    if (isNaN(agreementId)) {
-        return res.status(400).json({ message: 'Invalid agreement ID provided.' });
-    }
-
-    const fieldsToUpdate = {};
-    const allowedFields = [
-        'product_id', 'consignor_id', 'commission_rate', 'unsold_item_policy',
-        'store_purchase_percentage', 'agreement_acknowledged', 'acknowledgment_date',
-        // 'discount_policy' will be handled specially, not in this array
-    ];
-
-    let hasValidField = false;
-    for (const field of allowedFields) {
-        if (updateData[field] !== undefined) {
-            // Type conversion for numeric/boolean/date fields
-            if (['product_id', 'consignor_id'].includes(field)) {
-                fieldsToUpdate[field] = parseInt(updateData[field]);
-            } else if (['commission_rate', 'store_purchase_percentage'].includes(field)) {
-                fieldsToUpdate[field] = parseFloat(updateData[field]);
-            } else if (field === 'agreement_acknowledged') {
-                fieldsToUpdate[field] = Boolean(updateData[field]);
-            } else if (field === 'acknowledgment_date') {
-                fieldsToUpdate[field] = updateData[field] ? new Date(updateData[field]).toISOString() : null;
-            } else {
-                fieldsToUpdate[field] = updateData[field];
-            }
-            hasValidField = true;
-        }
-    }
-
-    // Special handling for discount_policy JSONB
-    const currentAgreementQuery = await supabase
-        .from('agreements')
-        .select('discount_policy')
-        .eq('id', agreementId)
-        .single();
-
-    if (currentAgreementQuery.error) {
-        console.error("Supabase Error - updateAgreement (fetching current discount_policy):", currentAgreementQuery.error);
-        return res.status(500).json({ message: 'Error fetching current agreement data for update.', error: currentAgreementQuery.error.message });
-    }
-
-    const currentDiscountPolicy = currentAgreementQuery.data.discount_policy || {};
-
-    let newDiscountPolicy = { ...currentDiscountPolicy }; // Start with current or empty object
-
-    let discountPolicyUpdated = false;
-    // Check for individual discount fields in updateData
-    if (updateData.discount_enabled !== undefined) {
-        newDiscountPolicy.enabled = Boolean(updateData.discount_enabled);
-        discountPolicyUpdated = true;
-    }
-    if (updateData.discount_percentage !== undefined) {
-        newDiscountPolicy.percentage = parseFloat(updateData.discount_percentage);
-        discountPolicyUpdated = true;
-    }
-    if (updateData.discount_start_after_days !== undefined) {
-        newDiscountPolicy.start_after_days = parseInt(updateData.discount_start_after_days);
-        discountPolicyUpdated = true;
-    }
-    if (updateData.discount_interval_days !== undefined) {
-        newDiscountPolicy.interval_days = parseInt(updateData.discount_interval_days);
-        discountPolicyUpdated = true;
-    }
-
-    // If a complete discount_policy object is sent (e.g., from frontend form data)
-    if (updateData.discount_policy && typeof updateData.discount_policy === 'object') {
-        newDiscountPolicy = { ...newDiscountPolicy, ...updateData.discount_policy };
-        discountPolicyUpdated = true;
-    }
-
-    if (discountPolicyUpdated) {
-        fieldsToUpdate.discount_policy = newDiscountPolicy;
-        hasValidField = true;
-    }
-
-
-    fieldsToUpdate.updated_at = new Date().toISOString();
-
-    if (!hasValidField && Object.keys(fieldsToUpdate).length === 1 && fieldsToUpdate.updated_at) {
-        return res.status(400).json({ message: 'No valid fields provided for agreement update.' });
-    }
+    console.log('[%s] PUT /api/agreements/:id called. Body: %j', new Date().toISOString(), req.body);
 
     try {
-        const { data, error } = await supabase
+        const agreementId = parseInt(req.params.id);
+        if (isNaN(agreementId)) {
+            return res.status(400).json({ message: 'Invalid agreement ID' });
+        }
+
+        const {
+            productId,
+            consignorId,
+            commissionRate,
+            unsoldItemPolicy,
+            returnFallbackDays,
+            discountSchedule = [],
+            charityChoice,
+            agreementAcknowledged,
+            acknowledgmentDate,
+            storePurchaseOption = false,    // Added
+            storePurchasePercentage = 0,    // Added
+        } = req.body;
+
+        // --- Data Pre-processing for PostgreSQL RPC ---
+        let processedAcknowledgmentDate = null;
+        if (acknowledgmentDate) {
+            try {
+                processedAcknowledgmentDate = new Date(acknowledgmentDate).toISOString();
+            } catch (e) {
+                console.warn(`[updateAgreement] Invalid acknowledgmentDate format received: "${acknowledgmentDate}". Setting to null.`);
+                processedAcknowledgmentDate = null;
+            }
+        }
+
+        const determinedDiscountScheduleEnabled = discountSchedule && discountSchedule.length > 0;
+        const processedDiscountSchedule = determinedDiscountScheduleEnabled
+            ? JSON.stringify(discountSchedule)
+            : '[]';
+
+        const processedReturnFallbackDays = unsoldItemPolicy === 'return'
+            ? returnFallbackDays
+            : null;
+
+        // Prepare parameters for the PostgreSQL function
+        const rpcPayload = {
+            p_agreement_id: agreementId,
+            p_acknowledgment_date: processedAcknowledgmentDate,
+            p_agreement_acknowledged: agreementAcknowledged,
+            p_charity_choice: unsoldItemPolicy === 'donate' ? charityChoice : null,
+            p_commission_rate: commissionRate,
+            p_consignor_id: consignorId,
+            p_discount_schedule: processedDiscountSchedule,
+            p_discount_schedule_enabled: determinedDiscountScheduleEnabled,
+            p_product_id: productId,
+            p_return_fallback_days: processedReturnFallbackDays,
+            p_unsold_item_policy: unsoldItemPolicy,
+            p_store_purchase_option: storePurchaseOption,      // Added
+            p_store_purchase_percentage: storePurchasePercentage, // Added
+        };
+
+        console.log('--- RPC Payload for update_agreement_with_details:', JSON.stringify(rpcPayload, null, 2));
+
+        const { data: agreement, error: updateError } = await supabase
+            .rpc('update_agreement_with_details', rpcPayload);
+
+        if (updateError) {
+            console.error('Supabase RPC Error (update_agreement_with_details):', updateError);
+            if (updateError.code === 'PGRST203') {
+                return res.status(400).json({
+                    message: 'Database function `update_agreement_with_details` not found or parameter types mismatch. Ensure your database functions are correctly deployed and match the payload types.',
+                    error: updateError.message,
+                    details: updateError.details
+                });
+            }
+            return res.status(500).json({
+                message: 'Internal server error during agreement update.',
+                error: updateError.message,
+                details: updateError.details || 'No additional details provided from database.'
+            });
+        }
+
+        const { data: updatedAgreement, error: fetchError } = await supabase
             .from('agreements')
-            .update(fieldsToUpdate)
-            .eq('id', agreementId)
             .select(`
                 *,
-                products (id, name, category),
-                consignors (id, full_name, email)
-            `);
+                progressive_discounts:progressive_discounts(id, days_after_listing, discount_percent),
+                charity_donations:charity_donations(id, charity_choice)
+            `)
+            .eq('id', agreementId)
+            .single();
 
-        if (error) {
-            console.error(`Supabase Error - updateAgreement for ID ${agreementId}:`, error);
-            if (error.code === '23503') { // Foreign key violation
-                return res.status(400).json({ message: 'Invalid product_id or consignor_id provided for update.', error: error.message });
-            }
-            return res.status(500).json({ message: 'Error updating agreement in database', error: error.message });
+        if (fetchError) {
+            console.error('Supabase Fetch Error (after update):', fetchError);
+            throw fetchError;
+        }
+        if (!updatedAgreement) {
+            throw new Error('Agreement not found after successful update and fetch');
         }
 
-        if (data.length === 0) {
-            return res.status(404).json({ message: `Agreement with ID ${agreementId} not found.` });
-        }
+        const response = {
+            ...toCamelCase(updatedAgreement),
+            discountPolicy: updatedAgreement.progressive_discounts?.length > 0 ? 'discount' : 'none',
+            discountSchedule: updatedAgreement.progressive_discounts?.map(d => ({
+                days: d.days_after_listing,
+                percent: d.discount_percent
+            })) || [],
+            charityChoice: updatedAgreement.charity_donations?.[0]?.charity_choice || null,
+            discountScheduleEnabled: updatedAgreement.progressive_discounts?.length > 0
+        };
 
-        console.log(`[${new Date().toISOString()}] Agreement ID ${agreementId} updated in DB:`, data[0]);
-        res.status(200).json(data[0]);
-    } catch (err) {
-        console.error("Server Error - updateAgreement:", err);
-        res.status(500).json({ message: 'Internal server error', error: err.message });
+        res.status(200).json(response);
+    } catch (error) {
+        console.error('Error in updateAgreement:', error);
+        res.status(500).json({
+            message: 'Internal server error',
+            error: error.message,
+            details: error.details || 'No additional details provided from database.'
+        });
     }
 };
 
-// Delete an agreement by ID
+// Delete agreement (no changes needed)
 exports.deleteAgreement = async (req, res) => {
-    const agreementId = parseInt(req.params.id);
-    console.log(`[${new Date().toISOString()}] DELETE /api/agreements/${agreementId} called.`);
-
-    if (isNaN(agreementId)) {
-        return res.status(400).json({ message: 'Invalid agreement ID provided.' });
-    }
+    console.log('[%s] DELETE /api/agreements/:id called. ID: %s', new Date().toISOString(), req.params.id);
 
     try {
-        const { data, error } = await supabase
+        const agreementId = parseInt(req.params.id);
+        if (isNaN(agreementId)) {
+            return res.status(400).json({ message: 'Invalid agreement ID' });
+        }
+
+        const { error } = await supabase
             .from('agreements')
             .delete()
-            .eq('id', agreementId)
-            .select(); // Select to confirm deletion
+            .eq('id', agreementId);
 
-        if (error) {
-            console.error(`Supabase Error - deleteAgreement for ID ${agreementId}:`, error);
-            return res.status(500).json({ message: 'Error deleting agreement from database', error: error.message });
-        }
+        if (error) throw error;
 
-        if (data.length === 0) {
-            return res.status(404).json({ message: `Agreement with ID ${agreementId} not found.` });
-        }
-
-        console.log(`[${new Date().toISOString()}] Agreement ID ${agreementId} deleted successfully.`);
-        res.status(204).send(); // 204 No Content
-    } catch (err) {
-        console.error("Server Error - deleteAgreement:", err);
-        res.status(500).json({ message: 'Internal server error', error: err.message });
+        res.status(204).end();
+    } catch (error) {
+        console.error('Error in deleteAgreement:', error);
+        res.status(500).json({
+            message: 'Internal server error',
+            error: error.message
+        });
     }
 };
